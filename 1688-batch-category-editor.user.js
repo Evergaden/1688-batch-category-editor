@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         1688 批量修改类目与商品信息
 // @namespace    violet.local.1688
-// @version      0.6.0
+// @version      0.6.1
 // @description  在1688工作台中用AI或文字替换批量修改标题，也可修改类目、属性、发货时间和件重尺。
 // @match        https://work.1688.com/*
 // @match        https://*.1688.com/*
@@ -501,28 +501,56 @@
       .find((el) => compact(el.textContent) === compact(labelText));
     const marker = findMarker();
     if (!marker) return false;
-    const findContainer = () => {
+
+    const distance = (a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      const ax = ar.left + ar.width / 2;
+      const ay = ar.top + ar.height / 2;
+      const bx = br.left + br.width / 2;
+      const by = br.top + br.height / 2;
+      return Math.hypot(ax - bx, ay - by);
+    };
+    const clickableFor = (control) => {
+      const wrapped = control.closest('label,[role=checkbox],.next-checkbox,.ant-checkbox,[class*=checkbox],[class*=Checkbox]');
+      return wrapped && visible(wrapped) ? wrapped : control;
+    };
+    const findControl = () => {
       const currentMarker = findMarker();
       if (!currentMarker) return null;
-      let currentContainer = currentMarker.closest('label');
-      if (currentContainer) return currentContainer;
-      let node = currentMarker;
-      for (let depth = 0; node && depth < 5; depth += 1, node = node.parentElement) {
-        if (all('input[type=checkbox]', node).length === 1 && clean(node.textContent).includes(labelText)) {
-          currentContainer = node; break;
+      const directLabel = currentMarker.closest('label');
+      const direct = directLabel && all('input[type=checkbox],[role=checkbox]', directLabel)[0];
+      if (direct) return direct;
+
+      let scope = currentMarker.parentElement;
+      for (let depth = 0; scope && depth < 7; depth += 1, scope = scope.parentElement) {
+        const controls = all('input[type=checkbox],[role=checkbox]', scope)
+          .filter((el) => !el.closest('#v1688-panel'));
+        if (controls.length) {
+          return controls
+            .map((control) => ({ control, clickTarget: clickableFor(control) }))
+            .filter(({ clickTarget }) => visible(clickTarget))
+            .sort((a, b) => distance(a.clickTarget, currentMarker) - distance(b.clickTarget, currentMarker))[0]?.control || null;
         }
       }
-      return currentContainer || currentMarker.parentElement || currentMarker;
+      return null;
     };
-    const container = findContainer();
     const checked = () => {
-      const currentContainer = findContainer();
-      const checkbox = currentContainer && all('input[type=checkbox]', currentContainer)[0];
-      return !!checkbox?.checked || currentContainer?.getAttribute('aria-checked') === 'true' ||
-        /checked|selected/.test(String(currentContainer?.className || '').toLowerCase());
+      const control = findControl();
+      const wrapper = control && clickableFor(control);
+      const native = control?.matches('input[type=checkbox]') ? control : control?.querySelector('input[type=checkbox]');
+      const lineage = [control, wrapper, wrapper?.parentElement].filter(Boolean);
+      return !!native?.checked || lineage.some((el) => el.getAttribute?.('aria-checked') === 'true') ||
+        lineage.some((el) => /checked|selected/.test(String(el.className || '').toLowerCase()));
     };
     if (checked()) return true;
-    return activateWithAncestorsUntil(marker.closest('label,[role=checkbox]') || marker, checked, 800);
+    const control = findControl();
+    if (!control) return false;
+    const clickTarget = clickableFor(control);
+    if (await activateWithAncestorsUntil(clickTarget, checked, 1200)) return true;
+    // 部分 Next/React 组件将原生 input 设为不可见，但仍会处理程序化 click。
+    control.click();
+    return waitUntil(checked, 1200, 150);
   }
 
   function findColorCategoryInput() {
@@ -1228,7 +1256,7 @@
         #v1688-panel .v-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}#v1688-panel button{border:0;border-radius:8px;padding:8px 10px;background:var(--v-blue);color:#fff;font:600 12px/1.2 inherit;cursor:pointer;transition:transform .12s,filter .12s}#v1688-panel button:hover{filter:brightness(.96)}#v1688-panel button:active{transform:translateY(1px)}#v1688-panel button.v-secondary{background:#e2e8f0;color:#334155}#v1688-panel button.v-ghost{background:#fff;color:#2563eb;border:1px solid #bfdbfe}#v1688-panel button.v-danger{background:#fee2e2;color:#b91c1c}#v1688-panel button.v-wide{grid-column:1/-1}
         #v1688-log{white-space:pre-wrap;background:#0f172a;color:#cbd5e1;min-height:82px;max-height:150px;overflow:auto;padding:9px;border-radius:9px;margin-top:8px;font:10.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
       </style>
-      <div class="v-head"><div class="v-logo">88</div><div class="v-heading"><div class="v-title">1688 批量编辑</div><div class="v-sub">Category & Offer Ops · v0.6.0</div></div><span class="v-status">${escapeHtml(phaseLabel)}</span><button id="v-collapse" title="缩小/展开">${s.panelCollapsed ? '+' : '−'}</button></div>
+          <div class="v-head"><div class="v-logo">88</div><div class="v-heading"><div class="v-title">1688 批量编辑</div><div class="v-sub">Category & Offer Ops · v0.6.1</div></div><span class="v-status">${escapeHtml(phaseLabel)}</span><button id="v-collapse" title="缩小/展开">${s.panelCollapsed ? '+' : '−'}</button></div>
       <div class="v-body">
         <section class="v-card"><div class="v-section"><span>标题批量替换</span><span class="v-hint">逐个商品生效</span></div>
           <div class="v-grid2"><div><label class="v-field">查找文字</label><input id="v-title-find" type="text" value="${escapeHtml(s.titleFind)}"></div><div><label class="v-field">替换为</label><input id="v-title-replace" type="text" value="${escapeHtml(s.titleReplace)}"></div></div>
