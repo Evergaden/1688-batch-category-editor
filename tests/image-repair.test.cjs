@@ -12,9 +12,10 @@ function setup(html = '') {
   w.GM_getValue = () => stored;
   w.GM_setValue = (_key, value) => { stored = value; };
   w.HTMLElement.prototype.getClientRects = function () { return this.hidden ? [] : [{ width: 100, height: 100 }]; };
+  w.HTMLElement.prototype.scrollIntoView = function () {};
   const instrumented = script.replace(/  if \(document.readyState === 'loading'\)[\s\S]*$/, `
     window.testApi = { imageUrl, imageKey, mainImageEntries, detailImageUrls, usableMainImage, similarImage, settingsError,
-      repairMainImages, appendMainImage, fillCurrentForm, submitCurrent, autoRun, save, load, DEFAULTS,
+      repairMainImages, appendMainImage, fillCurrentForm, submitCurrent, autoRun, save, load, DEFAULTS, ensureCheckboxChecked,
       mockRepair: (fn) => { repairMainImages = fn; },
       mockImageReads: (read, inspect) => { readImageBlob = read; inspectImage = inspect; },
       setWait: (fn) => { waitUntil = fn; }
@@ -148,5 +149,69 @@ test('missing/unreadable thumbnail fails counting instead of treating it as an e
   const { api, dom, w } = setup(fixture());
   w.document.querySelector('#main img').src = 'blob:upload-in-progress';
   assert.throws(() => api.mainImageEntries(), /暂停计数/);
+  dom.window.close();
+});
+
+function supplyFixture(custom = '<span class="ant-checkbox"><input id="custom" type="checkbox" hidden></span><span>定制 支持基于现款的交期定制、属性定制、特色服务</span>') {
+  return `<section><div><span>*供货方式</span><label><input id="stock" type="checkbox" checked>现货 库存充足商品</label>
+    <div id="custom-option">${custom}</div></div></section>
+    <section><label><input id="other" type="checkbox">定制</label></section>
+    <aside id="v1688-panel"><label><input type="checkbox">定制</label></aside>`;
+}
+
+test('custom checkbox with long combined span label and hidden native input is checked exactly once', async () => {
+  const { api, dom, w } = setup(supplyFixture());
+  let clicks = 0;
+  w.document.querySelector('#custom').addEventListener('click', () => clicks++);
+  assert.equal(await api.ensureCheckboxChecked('定制'), true);
+  assert.equal(w.document.querySelector('#custom').checked, true);
+  assert.equal(w.document.querySelector('#stock').checked, true);
+  assert.equal(w.document.querySelector('#other').checked, false);
+  assert.equal(clicks, 1);
+  assert.equal(await api.ensureCheckboxChecked('定制'), true);
+  assert.equal(clicks, 1);
+  dom.window.close();
+});
+
+test('native unchecked state is not overridden by an unchecked/shared selected class', async () => {
+  const { api, dom, w } = setup(supplyFixture('<label class="unchecked selected"><input id="custom" type="checkbox"><span>定制支持基于现款的交期定制</span></label>'));
+  assert.equal(await api.ensureCheckboxChecked('定制'), true);
+  assert.equal(w.document.querySelector('#custom').checked, true);
+  dom.window.close();
+});
+
+test('custom checkbox validation reacquires DOM after framework rerender', async () => {
+  const { api, dom, w } = setup(supplyFixture());
+  const original = w.document.querySelector('#custom');
+  original.addEventListener('click', () => {
+    w.document.querySelector('#custom-option').innerHTML = '<label><input id="custom" type="checkbox" checked><span>定制 支持基于现款的交期定制</span></label>';
+  });
+  assert.equal(await api.ensureCheckboxChecked('定制'), true);
+  assert.notEqual(w.document.querySelector('#custom'), original);
+  dom.window.close();
+});
+
+test('disabled custom option stops without toggling stock', async () => {
+  const { api, dom, w } = setup(supplyFixture('<label><input id="custom" type="checkbox" disabled>定制 支持交期定制</label>'));
+  assert.equal(await api.ensureCheckboxChecked('定制'), false);
+  assert.equal(w.document.querySelector('#stock').checked, true);
+  assert.equal(w.document.querySelector('#custom').checked, false);
+  dom.window.close();
+});
+
+test('a framework-reverted checkbox is reported as failure without repeated clicks', async () => {
+  const { api, dom, w } = setup(supplyFixture());
+  let clicks = 0;
+  w.document.querySelector('#custom').addEventListener('click', (event) => { clicks++; event.target.checked = false; });
+  api.setWait(async (test) => test());
+  assert.equal(await api.ensureCheckboxChecked('定制'), false);
+  assert.equal(clicks, 1);
+  dom.window.close();
+});
+
+test('role checkbox with description uses its own aria-checked state', async () => {
+  const { api, dom, w } = setup(supplyFixture('<div id="custom" role="checkbox" aria-checked="false"><span>定制 支持交期定制</span></div>'));
+  w.document.querySelector('#custom').addEventListener('click', (event) => event.currentTarget.setAttribute('aria-checked', 'true'));
+  assert.equal(await api.ensureCheckboxChecked('定制'), true);
   dom.window.close();
 });
