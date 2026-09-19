@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         1688 批量修改类目与商品信息
 // @namespace    violet.local.1688
-// @version      0.6.1
+// @version      0.7.0
 // @description  在1688工作台中用AI或文字替换批量修改标题，也可修改类目、属性、发货时间和件重尺。
 // @match        https://work.1688.com/*
 // @match        https://*.1688.com/*
@@ -10,6 +10,8 @@
 // @grant        GM_deleteValue
 // @grant        GM_xmlhttpRequest
 // @connect      token.sensenova.cn
+// @connect      alicdn.com
+// @connect      1688.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -31,6 +33,10 @@
     measurementUnit: '个',
     titleReplaceEnabled: true,
     titleOnlyMode: false,
+    mainImageRepairEnabled: false,
+    mainImageOnlyMode: false,
+    mainImageTarget: 4,
+    mainImageCheck: null,
     aiTitleEnabled: false,
     aiApiKey: '',
     aiBaseUrl: 'https://token.sensenova.cn/v1/chat/completions',
@@ -1089,7 +1095,246 @@
     return true;
   }
 
+  // Image repair uses the site's upload input; it never inserts thumbnail DOM or alters editor state privately.
+  function imageUrl(value, base = location.href) {
+    try {
+      const url = new URL(String(value || '').startsWith('//') ? `https:${value}` : value, base);
+      if (url.protocol !== 'https:' || !/(^|\.)(alicdn\.com|1688\.com)$/.test(url.hostname)) return '';
+      return url.href;
+    } catch (_) { return ''; }
+  }
+
+  function imageKey(value) {
+    try {
+      const url = new URL(value);
+      // Comparison only: always download the observed URL, never a guessed original URL.
+      return `${url.hostname}${url.pathname.replace(/(\.(?:jpg|jpeg|png))_\d+x\d+[^/]*$/i, '$1')}`;
+    } catch (_) { return value; }
+  }
+
+  function imageSource(img) {
+    return imageUrl(img.getAttribute('data-original') || img.getAttribute('data-src') || img.currentSrc || img.getAttribute('src'), img.ownerDocument.baseURI);
+  }
+
+  function findMainImageRoot() {
+    const markers = candidatesByText('商品主图').filter((el) => !el.closest('#v1688-panel'))
+      .filter((el) => compact(el.textContent).replace(/^\*/, '') === '商品主图');
+    for (const marker of markers) {
+      for (let root = marker.parentElement, depth = 0; root && depth < 7; root = root.parentElement, depth += 1) {
+        const hasOtherSection = all('label,span,div,td', root).some((el) => /^(白底图|商品视频|商品详情)$/.test(compact(el.textContent).replace(/^\*/, '')));
+        if (hasOtherSection || root.querySelector('#v1688-panel')) break;
+        if (all('input[type=file]', root).length || candidatesByText('添加图片', root).length) return root;
+      }
+    }
+    return null;
+  }
+
+  function mainImageEntries() {
+    const root = findMainImageRoot();
+    if (!root) throw new Error('补主图：未识别到独立的商品主图区，已暂停');
+    const entries = all('img', root).filter(visible).filter((img) => {
+      if (!imageSource(img)) return false;
+      for (let node = img.parentElement; node && node !== root; node = node.parentElement) {
+        if (clean(node.textContent).includes('删除') && all('img', node).length === 1) return true;
+      }
+      return false;
+    }).map((img) => ({ url: imageSource(img), key: imageKey(imageSource(img)) }));
+    const deleteMarkers = candidatesByText('删除', root).filter((el) => compact(el.textContent) === '删除' &&
+      ![...el.children].some((child) => compact(child.textContent) === '删除'));
+    if (deleteMarkers.length !== entries.length) throw new Error('补主图：部分主图尚未加载或缩略图结构不支持，已暂停计数');
+    return entries;
+  }
+
+  function detailImageUrls() {
+    const roots = new Set();
+    const markers = candidatesByText('商品详情').concat(candidatesByText('图文详情'))
+      .filter((el) => !el.closest('#v1688-panel'))
+      .filter((el) => /^(商品详情|图文详情)$/.test(compact(el.textContent).replace(/^\*/, '')));
+    for (const marker of markers) {
+      for (let root = marker.parentElement, depth = 0; root && depth < 8; root = root.parentElement, depth += 1) {
+        if (root.querySelector('#v1688-panel') || root.contains(findMainImageRoot())) break;
+        if (root.querySelector('iframe,[contenteditable=true],textarea')) { roots.add(root); break; }
+      }
+    }
+    const urls = [];
+    const addImages = (root) => all('img', root).forEach((img) => { const url = imageSource(img); if (url) urls.push(url); });
+    for (const root of roots) {
+      all('[contenteditable=true]', root).forEach(addImages);
+      for (const frame of all('iframe', root)) {
+        try { if (frame.contentDocument?.body) addImages(frame.contentDocument.body); } catch (_) { /* cross-origin editor: stop if no readable source */ }
+      }
+      for (const field of all('textarea', root)) {
+        if (/<img\b/i.test(field.value)) addImages(new DOMParser().parseFromString(field.value, 'text/html'));
+      }
+    }
+    return [...new Map(urls.map((url) => [imageKey(url), url])).values()];
+  }
+
+  function readImageBlob(url) {
+    return new Promise((resolve, reject) => {
+      if (!imageUrl(url)) return reject(new Error('图片不是支持的1688/阿里图片地址'));
+      GM_xmlhttpRequest({
+        method: 'GET', url, responseType: 'blob', anonymous: true, timeout: 20000,
+        onload: (response) => {
+          const blob = response.response;
+          if (response.status !== 200 || !blob || blob.size === 0 || !/^image\/(jpeg|png|webp)$/i.test(blob.type)) {
+            reject(new Error(`图片下载失败或格式不支持（HTTP ${response.status}）`)); return;
+          }
+          if (blob.size > 5 * 1024 * 1024) { reject(new Error('图片超过5MB，跳过')); return; }
+          resolve(blob);
+        },
+        onerror: () => reject(new Error('图片下载失败，请检查油猴图片域名授权或网络')),
+        ontimeout: () => reject(new Error('图片下载超时'))
+      });
+    });
+  }
+
+  async function inspectImage(blob) {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 9; canvas.height = 8;
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bitmap, 0, 0, 9, 8);
+      const pixels = ctx.getImageData(0, 0, 9, 8).data;
+      const gray = (i) => pixels[i] * 0.299 + pixels[i + 1] * 0.587 + pixels[i + 2] * 0.114;
+      let hash = '';
+      for (let y = 0; y < 8; y += 1) for (let x = 0; x < 8; x += 1) {
+        const offset = (y * 9 + x) * 4;
+        hash += gray(offset) > gray(offset + 4) ? '1' : '0';
+      }
+      return { width: bitmap.width, height: bitmap.height, hash };
+    } finally { bitmap.close(); }
+  }
+
+  function similarImage(a, b, tolerance = 3) {
+    return !!a && !!b && a.length === b.length && [...a].filter((bit, i) => bit !== b[i]).length <= tolerance;
+  }
+
+  function usableMainImage(info) {
+    return Math.min(info.width, info.height) >= 800 && info.width / info.height >= 0.8 && info.width / info.height <= 1.25;
+  }
+
+  function assertImageTaskRunning() {
+    if (!load().running) throw new Error('补主图任务已停止');
+  }
+
+  function repairProductId() {
+    const params = new URLSearchParams(location.search);
+    return params.get('id') || params.get('offerId') || '';
+  }
+
+  async function findMainUploadInput() {
+    const root = findMainImageRoot();
+    const pickInput = (scope) => {
+      const inputs = all('input[type=file]', scope).filter((input) => !input.disabled && !/video/i.test(input.accept));
+      return inputs.length === 1 ? inputs[0] : null;
+    };
+    const direct = root && pickInput(root);
+    if (direct) return direct;
+    const add = root && candidatesByText('添加图片', root).find((el) => compact(el.textContent) === '添加图片');
+    if (!add) throw new Error('补主图：未找到添加图片入口');
+    const dialogSelector = '[role=dialog],.next-dialog,.ant-modal';
+    const previous = new Set(all(dialogSelector).filter(visible));
+    add.click();
+    const input = await waitUntil(() => {
+      const fresh = findMainImageRoot();
+      if (fresh && pickInput(fresh)) return pickInput(fresh);
+      const opened = all(dialogSelector).filter(visible).filter((el) => !previous.has(el));
+      const choices = opened.map(pickInput).filter(Boolean);
+      return choices.length === 1 ? choices[0] : null;
+    }, 4000);
+    if (!input) throw new Error('补主图：添加图片后未找到唯一的上传框，请保留弹窗并截图；已停止，不会点击其他上传区');
+    return input;
+  }
+
+  async function appendMainImage(candidate, before) {
+    const input = await findMainUploadInput();
+    assertImageTaskRunning();
+    if (mainImageEntries().map((entry) => entry.key).join('|') !== before.map((entry) => entry.key).join('|')) {
+      throw new Error('上传前主图发生变化，请核对当前图片再继续');
+    }
+    const view = input.ownerDocument.defaultView;
+    const transfer = new view.DataTransfer();
+    const extension = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' }[candidate.blob.type.toLowerCase()];
+    transfer.items.add(new view.File([candidate.blob], `detail-${repairProductId()}-${Date.now()}.${extension}`, { type: candidate.blob.type }));
+    input.files = transfer.files;
+    input.dispatchEvent(new view.Event('change', { bubbles: true }));
+    const added = await waitUntil(() => {
+      try {
+        const entries = mainImageEntries();
+        return entries.length === before.length + 1 && entries.slice(0, before.length).every((entry, i) => entry.key === before[i].key) ? entries : null;
+      } catch (_) { return null; } // uploading placeholders may temporarily have only blob URLs
+    }, 25000, 500);
+    if (!added) throw new Error('补主图：上传后数量/原图顺序校验未通过；请检查上传弹窗，避免重复添加');
+    const result = await inspectImage(await readImageBlob(added[added.length - 1].url));
+    if (!similarImage(result.hash, candidate.hash, 8)) throw new Error('补主图：新增缩略图与所选详情图不匹配，已暂停发布');
+    return added;
+  }
+
+  async function repairMainImages(settings) {
+    const target = Number(settings.mainImageTarget);
+    if (!Number.isInteger(target) || target < 1 || target > 5) throw new Error('主图目标数量须为1～5');
+    const productId = repairProductId();
+    if (!productId) throw new Error('补主图：无法确认当前商品ID');
+    let current = mainImageEntries();
+    const previousCheck = load().mainImageCheck;
+    if (previousCheck?.productId === productId && previousCheck.status === 'uploading') {
+      throw new Error('上一轮图片上传结果未确认。请核对现有主图后，点击“确认当前主图并解除补图暂停”，再测试');
+    }
+    if (current.length >= target) {
+      const dirty = previousCheck?.productId === productId && !!previousCheck.dirty;
+      save({ mainImageCheck: { productId, status: 'verified', dirty, keys: current.map((entry) => entry.key) } });
+      log(`主图已有${current.length}张，目标${target}张，无需继续补图${dirty ? '，仍需保存' : ''}`); return dirty;
+    }
+    const urls = await waitUntil(() => { const found = detailImageUrls(); return found.length ? found : null; }, 8000, 500);
+    if (!urls) throw new Error('补主图：未读取到详情原图（编辑器尚未加载、跨域或结构不支持），已暂停');
+    const knownKeys = new Set(current.map((entry) => entry.key));
+    const hashes = [];
+    for (const entry of current) {
+      assertImageTaskRunning();
+      hashes.push((await inspectImage(await readImageBlob(entry.url))).hash);
+    }
+    const candidates = [];
+    log(`主图${current.length}/${target}，正在检查${Math.min(urls.length, 24)}张详情候选图`);
+    for (const url of urls.slice(0, 24)) {
+      assertImageTaskRunning();
+      if (knownKeys.has(imageKey(url))) continue;
+      try {
+        const blob = await readImageBlob(url);
+        const info = await inspectImage(blob);
+        if (!usableMainImage(info) || hashes.some((hash) => similarImage(hash, info.hash))) continue;
+        candidates.push({ url, blob, ...info });
+        hashes.push(info.hash);
+        knownKeys.add(imageKey(url));
+        if (candidates.length === target - current.length) break;
+      } catch (error) { log(`详情候选跳过：${error.message}`, 'warn'); }
+    }
+    if (candidates.length < target - current.length) throw new Error(`补主图：缺${target - current.length}张，仅找到${candidates.length}张不重复、短边≥800px的近方形图片；未开始上传`);
+    const originalKeys = current.map((entry) => entry.key);
+    for (const candidate of candidates) {
+      assertImageTaskRunning();
+      save({ mainImageCheck: { productId, status: 'uploading', dirty: true, originalKeys, source: candidate.url } });
+      current = await appendMainImage(candidate, current);
+      save({ mainImageCheck: { productId, status: 'added', dirty: true, keys: current.map((entry) => entry.key) } });
+      log(`详情图已补入主图：${current.length}/${target}（新增图片已核对）`);
+      assertImageTaskRunning();
+    }
+    save({ mainImageCheck: { productId, status: 'verified', dirty: true, keys: current.map((entry) => entry.key) } });
+    log('补主图完成，等待保存；原有主图顺序保持不变');
+    return true;
+  }
+
   async function fillCurrentForm(settings) {
+    if (settings.mainImageOnlyMode) {
+      log('开始仅补主图：跳过标题、类目和其他商品字段');
+      const changed = await repairMainImages(settings);
+      if (!changed) { finishOne(); return; }
+      save({ phase: 'ready-submit' });
+      if (settings.batchAutoSubmit && !settings.testMode) await submitCurrent();
+      else log('补图已写入，尚未保存。请检查主图后点击“提交当前商品并继续”', 'warn');
+      return;
+    }
     log(settings.titleOnlyMode ? '开始仅替换当前商品标题' : '开始填写当前商品表单');
     const titleChanged = await replaceProductTitle(settings);
     if (settings.titleOnlyMode) {
@@ -1116,6 +1361,7 @@
       }
       if (!await fillMeasurementUnit(settings)) throw new Error('计量单位修改失败，已暂停提交');
       fillPackage(settings);
+      if (settings.mainImageRepairEnabled) await repairMainImages(settings);
     }
     save({ phase: 'ready-submit' });
     if (settings.batchAutoSubmit && !settings.testMode) await submitCurrent();
@@ -1123,6 +1369,15 @@
   }
 
   async function submitCurrent() {
+    const settings = load();
+    if (settings.mainImageOnlyMode || (settings.mainImageRepairEnabled && !settings.titleOnlyMode)) {
+      const checked = settings.mainImageCheck;
+      const entries = mainImageEntries();
+      if (checked?.productId !== repairProductId() || checked.status !== 'verified' ||
+          entries.length < settings.mainImageTarget || entries.map((entry) => entry.key).join('|') !== checked.keys.join('|')) {
+        throw new Error('主图尚未校验通过或已变化，请重新测试补图后提交');
+      }
+    }
     const buttons = ['同意协议条款，我要发布', '保存并提交', '提交审核', '确认发布', '发布商品', '保存'];
     const chosen = buttons.find((name) => candidatesByText(name).some((el) => compact(el.textContent) === compact(name)));
     if (!chosen) {
@@ -1139,23 +1394,35 @@
     }
     const success = await waitUntil(() => /修改成功[\s\S]{0,40}商品已提交审核|商品已提交审核|发布成功|提交成功/.test(text()), 15000, 500);
     if (success) {
-      log('商品提交成功，直接进入队列下一个商品');
-      finishOne();
+      completeSubmittedProduct();
     } else if (text().includes('产品属性') || text().includes('发货服务')) {
       save({ phase: 'ready-submit' });
       log('未能自动确认提交结果。确认成功后点击“标记成功并下一个”；若有红字错误请先处理。', 'warn');
     }
   }
 
+  function completeSubmittedProduct() {
+    const state = load();
+    if (state.mainImageCheck?.dirty && state.mainImageCheck.status === 'verified') {
+      const editUrl = state.queue[state.current];
+      if (!editUrl || !isProductEditUrl(editUrl)) throw new Error('补图提交成功，但缺少原商品编辑链接，无法回读校验');
+      const params = new URL(editUrl).searchParams;
+      if ((params.get('id') || params.get('offerId')) !== state.mainImageCheck.productId) throw new Error('补图商品ID与队列不符，已暂停');
+      save({ phase: 'verify-images', running: true });
+      log('提交已成功，重新打开当前商品检查主图是否保存');
+      navigate(editUrl);
+    } else finishOne();
+  }
+
   function finishOne() {
     const state = load();
     const nextIndex = state.current + 1;
     if (nextIndex >= state.queue.length) {
-      save({ current: nextIndex, running: false, phase: 'done' });
+      save({ current: nextIndex, running: false, phase: 'done', mainImageCheck: null });
       log(`批次完成：${state.queue.length} 个商品`);
       return;
     }
-    save({ current: nextIndex, phase: 'open-edit' });
+    save({ current: nextIndex, phase: 'open-edit', mainImageCheck: null });
     log(`进入第 ${nextIndex + 1}/${state.queue.length} 个商品`);
     navigate(state.queue[nextIndex]);
   }
@@ -1170,7 +1437,20 @@
     try {
       // 兼容人工点击发布或旧版本留下的阶段状态：成功文案优先于 phase 判断。
       if (/修改成功[\s\S]{0,40}商品已提交审核|商品已提交审核|发布成功|提交成功/.test(body)) {
-        log('识别到提交成功页，直接进入队列下一个商品');
+        if (settings.phase === 'verify-images') throw new Error('回读商品仍停留成功页，请重新打开编辑页核对');
+        completeSubmittedProduct();
+        return;
+      }
+      if (settings.phase === 'verify-images') {
+        const expected = settings.mainImageCheck;
+        if (expected?.productId !== repairProductId()) throw new Error('保存后主图回读的商品ID不符');
+        const restored = await waitUntil(() => {
+          if (!findMainImageRoot()) return false;
+          try { return mainImageEntries().map((entry) => entry.key).join('|') === expected.keys.join('|'); }
+          catch (_) { return false; }
+        }, 18000, 500);
+        if (!restored) throw new Error('保存后主图数量或顺序未能确认，已暂停队列；不会重复上传');
+        log(`已重新打开并确认${expected.keys.length}张主图保存成功`);
         finishOne();
         return;
       }
@@ -1178,12 +1458,17 @@
       if (settings.phase === 'submitting') {
         const success = await waitUntil(() => /修改成功[\s\S]{0,40}商品已提交审核|商品已提交审核|发布成功|提交成功/.test(text()), 15000, 500);
         if (success) {
-          log('识别到提交成功页，直接进入队列下一个商品');
-          finishOne();
+          completeSubmittedProduct();
         } else {
           save({ running: false, phase: 'ready-submit' });
           log('等待提交结果超时，任务已暂停。请检查页面；若实际成功可点“标记成功 / 下一个”。', 'warn');
         }
+        return;
+      }
+      if (settings.mainImageOnlyMode && (settings.phase === 'open-edit' || settings.phase === 'fill-form')) {
+        if (!await waitUntil(() => !!findMainImageRoot(), 12000, 400)) throw new Error('仅补主图：等待商品主图区超时');
+        save({ phase: 'fill-form' });
+        await fillCurrentForm(settings);
         return;
       }
       if (settings.titleOnlyMode && (settings.phase === 'open-edit' || settings.phase === 'fill-form')) {
@@ -1236,6 +1521,19 @@
     }
   }
 
+  function settingsError(state) {
+    if (state.mainImageOnlyMode || (state.mainImageRepairEnabled && !state.titleOnlyMode)) {
+      if (!Number.isInteger(state.mainImageTarget) || state.mainImageTarget < 1 || state.mainImageTarget > 5) return '主图目标数量须为1～5';
+    }
+    if (state.mainImageOnlyMode) return '';
+    if (state.aiTitleEnabled && !state.aiApiKey) return 'AI改写前必须填写日日新API密钥';
+    if (state.aiTitleEnabled && !state.aiModel) return 'AI改写前必须填写模型名称';
+    if (state.titleOnlyMode && !state.aiTitleEnabled && (!state.titleReplaceEnabled || !state.titleFind)) return '仅标题模式必须启用AI改写，或启用文字替换并填写查找文字';
+    if (!state.titleOnlyMode && (!state.weightG || !state.lengthCm || !state.widthCm || !state.heightCm)) return '开始前必须填写长、宽、高、重量';
+    if (!state.titleOnlyMode && state.customMode && !state.colorCategoryValue) return '定制模式必须填写颜色分类目标值';
+    return '';
+  }
+
   function renderPanel() {
     if (document.querySelector('#v1688-panel')) return;
     const s = load();
@@ -1256,8 +1554,14 @@
         #v1688-panel .v-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}#v1688-panel button{border:0;border-radius:8px;padding:8px 10px;background:var(--v-blue);color:#fff;font:600 12px/1.2 inherit;cursor:pointer;transition:transform .12s,filter .12s}#v1688-panel button:hover{filter:brightness(.96)}#v1688-panel button:active{transform:translateY(1px)}#v1688-panel button.v-secondary{background:#e2e8f0;color:#334155}#v1688-panel button.v-ghost{background:#fff;color:#2563eb;border:1px solid #bfdbfe}#v1688-panel button.v-danger{background:#fee2e2;color:#b91c1c}#v1688-panel button.v-wide{grid-column:1/-1}
         #v1688-log{white-space:pre-wrap;background:#0f172a;color:#cbd5e1;min-height:82px;max-height:150px;overflow:auto;padding:9px;border-radius:9px;margin-top:8px;font:10.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
       </style>
-          <div class="v-head"><div class="v-logo">88</div><div class="v-heading"><div class="v-title">1688 批量编辑</div><div class="v-sub">Category & Offer Ops · v0.6.1</div></div><span class="v-status">${escapeHtml(phaseLabel)}</span><button id="v-collapse" title="缩小/展开">${s.panelCollapsed ? '+' : '−'}</button></div>
+          <div class="v-head"><div class="v-logo">88</div><div class="v-heading"><div class="v-title">1688 批量编辑</div><div class="v-sub">Category & Offer Ops · v0.7.0</div></div><span class="v-status">${escapeHtml(phaseLabel)}</span><button id="v-collapse" title="缩小/展开">${s.panelCollapsed ? '+' : '−'}</button></div>
       <div class="v-body">
+        <section class="v-card"><div class="v-section"><span>详情图补主图</span><span class="v-hint">保留已有主图及顺序</span></div>
+          <div class="v-checks"><label><input id="v-image-enable" type="checkbox" ${s.mainImageRepairEnabled ? 'checked' : ''}> 完整流程中补主图</label><label><input id="v-image-only" type="checkbox" ${s.mainImageOnlyMode ? 'checked' : ''}> 仅补主图，其他不更改</label></div>
+          <label class="v-field">补齐到几张（1～5）</label><input id="v-image-target" type="text" value="${escapeHtml(s.mainImageTarget)}">
+          <p class="v-hint">默认4张。取本商品详情中短边≥800px、接近方形且不重复的图片；不会裁切长图。仅标题模式不补图。请先测试当前商品确认选图。</p>
+          <button id="v-image-unlock" class="v-ghost">确认当前主图并解除补图暂停</button>
+        </section>
         <section class="v-card"><div class="v-section"><span>标题批量替换</span><span class="v-hint">逐个商品生效</span></div>
           <div class="v-grid2"><div><label class="v-field">查找文字</label><input id="v-title-find" type="text" value="${escapeHtml(s.titleFind)}"></div><div><label class="v-field">替换为</label><input id="v-title-replace" type="text" value="${escapeHtml(s.titleReplace)}"></div></div>
           <div class="v-checks"><label><input id="v-title-enable" type="checkbox" ${s.titleReplaceEnabled ? 'checked' : ''}> 启用文字替换</label><label><input id="v-ai-title" type="checkbox" ${s.aiTitleEnabled ? 'checked' : ''}> AI合规改写（优先）</label><label><input id="v-title-only" type="checkbox" ${s.titleOnlyMode ? 'checked' : ''}> 仅替换标题，其他不更改</label></div>
@@ -1292,6 +1596,9 @@
       const patch = {
         titleReplaceEnabled: document.querySelector('#v-title-enable').checked,
         titleOnlyMode: document.querySelector('#v-title-only').checked,
+        mainImageRepairEnabled: document.querySelector('#v-image-enable').checked,
+        mainImageOnlyMode: document.querySelector('#v-image-only').checked,
+        mainImageTarget: Number(value('#v-image-target')),
         aiTitleEnabled: document.querySelector('#v-ai-title').checked,
         aiModel: value('#v-ai-model'),
         aiRequestIntervalMs: Math.max(3000, (Number(value('#v-ai-interval')) || 12) * 1000),
@@ -1315,7 +1622,18 @@
       }
       return state;
     };
-    panel.addEventListener('change', persistForm);
+    panel.addEventListener('change', (event) => {
+      if (event.target.id === 'v-image-only' && event.target.checked) document.querySelector('#v-title-only').checked = false;
+      if (event.target.id === 'v-title-only' && event.target.checked) document.querySelector('#v-image-only').checked = false;
+      persistForm();
+    });
+    document.querySelector('#v-image-unlock').onclick = () => {
+      try {
+        const entries = mainImageEntries();
+        save({ mainImageCheck: { productId: repairProductId(), status: 'added', dirty: true, keys: entries.map((entry) => entry.key) } });
+        log(`已按人工确认记录当前${entries.length}张主图；请重新测试，再决定提交`, 'warn');
+      } catch (error) { log(error.message, 'error'); }
+    };
     document.querySelector('#v-collapse').onclick = () => {
       const collapsed = !panel.classList.contains('v-collapsed');
       panel.classList.toggle('v-collapsed', collapsed);
@@ -1329,11 +1647,9 @@
     };
     document.querySelector('#v-test').onclick = async () => {
       const state = persistForm();
-      if (state.aiTitleEnabled && !state.aiApiKey) return log('AI改写前必须填写日日新API密钥', 'error');
-      if (state.aiTitleEnabled && !state.aiModel) return log('AI改写前必须填写模型名称', 'error');
-      if (state.titleOnlyMode && !state.aiTitleEnabled && (!state.titleReplaceEnabled || !state.titleFind)) return log('仅标题模式必须启用AI改写，或启用文字替换并填写查找文字', 'error');
-      if (!state.titleOnlyMode && (!state.weightG || !state.lengthCm || !state.widthCm || !state.heightCm)) return log('测试前必须填写长、宽、高、重量', 'error');
-      if (!state.titleOnlyMode && state.customMode && !state.colorCategoryValue) return log('定制模式必须填写颜色分类目标值', 'error');
+      const error = settingsError(state);
+      if (error) return log(error, 'error');
+      document.querySelector('#v-urls').value = location.href;
       save({
         testMode: true,
         queue: [location.href],
@@ -1341,23 +1657,23 @@
         running: true,
         phase: 'open-edit'
       });
-      log(state.titleOnlyMode ? '开始当前商品仅标题流程' : '开始当前商品完整流程：先修改类目，再填写属性');
+      log(state.mainImageOnlyMode ? '开始当前商品仅补主图流程' : state.titleOnlyMode ? '开始当前商品仅标题流程' : '开始当前商品完整流程：先修改类目，再填写属性');
       await autoRun();
     };
     document.querySelector('#v-start').onclick = () => {
       const state = persistForm();
-      if (state.aiTitleEnabled && !state.aiApiKey) return log('AI改写前必须填写日日新API密钥', 'error');
-      if (state.aiTitleEnabled && !state.aiModel) return log('AI改写前必须填写模型名称', 'error');
-      if (state.titleOnlyMode && !state.aiTitleEnabled && (!state.titleReplaceEnabled || !state.titleFind)) return log('仅标题模式必须启用AI改写，或启用文字替换并填写查找文字', 'error');
-      if (!state.titleOnlyMode && (!state.weightG || !state.lengthCm || !state.widthCm || !state.heightCm)) return log('开始前必须填写长、宽、高、重量', 'error');
-      if (!state.titleOnlyMode && state.customMode && !state.colorCategoryValue) return log('定制模式必须填写颜色分类目标值', 'error');
+      const error = settingsError(state);
+      if (error) return log(error, 'error');
       if (!state.queue.length) return log('没有商品修改链接', 'error');
       const invalidCount = state.queue.filter((url) => !isProductEditUrl(url)).length;
       if (invalidCount) return log(`发现 ${invalidCount} 条非“修改详情”链接，已阻止开始。请重新点击“读取本页选中”`, 'error');
       save({ running: true, testMode: false, current: 0, phase: 'open-edit' });
       navigate(load().queue[0]);
     };
-    document.querySelector('#v-submit').onclick = async () => { persistForm(); await submitCurrent(); };
+    document.querySelector('#v-submit').onclick = async () => {
+      try { persistForm(); await submitCurrent(); }
+      catch (error) { save({ running: false }); log(error.message, 'error'); }
+    };
     document.querySelector('#v-next').onclick = finishOne;
     document.querySelector('#v-stop').onclick = () => { save({ running: false, phase: 'stopped' }); log('批量任务已停止', 'warn'); };
   }
